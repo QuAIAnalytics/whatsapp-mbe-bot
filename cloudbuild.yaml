@@ -1,0 +1,32 @@
+# CI/CD: en cada push a main, Cloud Build reconstruye la imagen y actualiza
+# el servicio de Cloud Run. Los env vars/secretos NO se tocan aquí (los pones
+# una vez a mano al crear el servicio o con `gcloud run services update`).
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "build",
+        "-t",
+        "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/whatsapp-mbe-bot:$SHORT_SHA",
+        ".",
+      ]
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "push",
+        "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/whatsapp-mbe-bot:$SHORT_SHA",
+      ]
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - whatsapp-mbe-bot
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/whatsapp-mbe-bot:$SHORT_SHA
+      - --region=us-central1
+      - --quiet
+
+options:
+  logging: CLOUD_LOGGING_ONLY
