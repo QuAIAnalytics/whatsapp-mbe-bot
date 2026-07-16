@@ -15,9 +15,12 @@ from google.genai import types
 
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Inicializa el cliente. El SDK detecta automáticamente la variable GEMINI_API_KEY
-# en el entorno, o de lo contrario recurre a las credenciales por defecto (Service Account / ADC).
-client = genai.Client()
+# Inicializa el cliente. Si existe GEMINI_API_KEY en el entorno, usa la API Key estándar.
+# De lo contrario, activa el modo Vertex AI para usar la Service Account (ADC).
+if os.environ.get("GEMINI_API_KEY"):
+    client = genai.Client()
+else:
+    client = genai.Client(vertex_ai=True)
 
 # Historial en RAM (se borra al reiniciar). La clave es libre: cada cliente
 # usa algo como "mbe:5076..." para no mezclar conversaciones entre demos.
