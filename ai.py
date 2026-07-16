@@ -48,11 +48,24 @@ HUMAN_MODE: set[str] = set()
 HANDOFF_REQUESTS: set[str] = set()
 
 
-def chat_reply(session_key: str, system_prompt: str, text: str) -> str | None:
-    """Conversación con memoria. Devuelve la respuesta del modelo o None si falla."""
+def chat_reply(session_key: str, system_prompt: str, text: str, history: list | None = None) -> str | None:
+    """Conversación con memoria. Devuelve la respuesta del modelo o None si falla.
+
+    Por defecto usa el historial en RAM (`SESSIONS`), keyed por `session_key`.
+    Si se pasa `history` (lista de dicts {"role": "user"|"model", "text": ...}),
+    se usa esa en su lugar (ej. reconstruida desde la conversación de Chatwoot,
+    que ya es persistente) y no se toca `SESSIONS`.
+    """
     if not client:
         return None
-    history = SESSIONS.get(session_key, [])
+    external_history = history is not None
+    if external_history:
+        history = [
+            types.Content(role=h["role"], parts=[types.Part(text=h["text"])])
+            for h in history
+        ]
+    else:
+        history = SESSIONS.get(session_key, [])
     try:
         chat = client.chats.create(
             model=GEMINI_MODEL,
@@ -60,7 +73,8 @@ def chat_reply(session_key: str, system_prompt: str, text: str) -> str | None:
             history=history,
         )
         response = chat.send_message(text)
-        SESSIONS[session_key] = chat.get_history()
+        if not external_history:
+            SESSIONS[session_key] = chat.get_history()
         return response.text.strip()
     except Exception as e:
         print(f"[GEMINI] chat ERROR: {e}")

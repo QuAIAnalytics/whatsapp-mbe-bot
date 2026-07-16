@@ -196,12 +196,20 @@ def _packages_reply(phone: str) -> str:
     return msg
 
 
-def handle(phone: str, text: str) -> str | None:
-    """Punto de entrada del cliente MBE."""
+def handle(phone: str, text: str, history: list | None = None) -> str | None:
+    """Punto de entrada del cliente MBE.
+
+    `history`: si viene (modo Chatwoot, reconstruido desde la conversación real,
+    que ya es persistente), se usa para decidir "¿ya lo saludé?" y como memoria
+    del chat, en vez de los sets/diccionarios en RAM (`GREETED`, `ai.SESSIONS`).
+    """
     intent = _classify(text)
-    first_time = phone not in GREETED
-    if first_time:
-        GREETED.add(phone)
+    if history is not None:
+        first_time = len(history) == 0
+    else:
+        first_time = phone not in GREETED
+        if first_time:
+            GREETED.add(phone)
 
     if intent == "PACKAGES":
         reply = _packages_reply(phone)
@@ -212,7 +220,7 @@ def handle(phone: str, text: str) -> str | None:
     if first_time:
         return WELCOME
 
-    reply = ai.chat_reply(f"mbe:{phone}", GENERAL_PROMPT, text)
+    reply = ai.chat_reply(f"mbe:{phone}", GENERAL_PROMPT, text, history=history)
     if reply is None:
         return "Disculpa, ahorita tengo un inconveniente tecnico. En un momento te atiendo."
 

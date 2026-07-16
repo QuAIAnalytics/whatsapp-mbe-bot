@@ -239,12 +239,41 @@ if CHATWOOT_ENABLED:
         except Exception as e:
             print(f"[CHATWOOT] handoff ERROR: {e}")
 
-    def cw_process(conversation_id: int, phone: str, text: str, message_id: str = "") -> None:
+    def cw_fetch_history(conversation_id: int, exclude_id, limit: int = 15) -> list:
+        """Trae los últimos mensajes de la conversación (ya persistidos en Chatwoot)
+        y los arma como historial para el cerebro, excluyendo el mensaje que
+        disparó este webhook (para no duplicarlo en la memoria).
+        """
+        try:
+            r = requests.get(
+                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/messages",
+                headers=_cw_headers(), timeout=10,
+            )
+            r.raise_for_status()
+            payload = r.json().get("payload", [])
+        except Exception as e:
+            print(f"[CHATWOOT] history ERROR: {e}")
+            return []
+
+        history = []
+        for m in payload:
+            if m.get("id") == exclude_id:
+                continue
+            content = (m.get("content") or "").strip()
+            # message_type: 0 = incoming (cliente), 1 = outgoing (bot/agente).
+            if not content or m.get("message_type") not in (0, 1):
+                continue
+            role = "user" if m.get("message_type") == 0 else "model"
+            history.append({"role": role, "text": content})
+        return history[-limit:]
+
+    def cw_process(conversation_id: int, phone: str, text: str, message_id: str = "", cw_message_id=None) -> None:
         """Corre el cerebro y responde por Chatwoot, en segundo plano (igual que WhatsApp)."""
         start = time.time()
         # Muestra "escribiendo..." en WhatsApp usando el id (wamid) del mensaje entrante.
         send_typing(message_id)
-        reply = handle_message(phone, text)
+        history = cw_fetch_history(conversation_id, cw_message_id)
+        reply = handle_message(phone, text, history=history)
         # Si el cerebro pidió pasar con una persona, lo recogemos para el handoff en Chatwoot.
         handoff = phone in ai.HANDOFF_REQUESTS
         ai.HANDOFF_REQUESTS.discard(phone)
@@ -322,10 +351,11 @@ if CHATWOOT_ENABLED:
         phone = _cw_phone(data)
         # source_id = id del mensaje original de WhatsApp (wamid); lo usamos para el typing.
         message_id = data.get("source_id") or ""
+        cw_message_id = data.get("id")
         print(f"[CHATWOOT] conv {conversation_id} ({phone}) wamid={message_id or '∅'}: {text}")
         threading.Thread(
             target=cw_process,
-            args=(conversation_id, phone, text, message_id),
+            args=(conversation_id, phone, text, message_id, cw_message_id),
             daemon=True,
         ).start()
         return make_response("ok", 200)
