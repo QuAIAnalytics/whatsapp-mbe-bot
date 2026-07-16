@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
 
 # 1 worker porque el estado (SESSIONS, HUMAN_MODE) vive en memoria del proceso:
 # varios workers partirían las conversaciones. --threads para atender varios
