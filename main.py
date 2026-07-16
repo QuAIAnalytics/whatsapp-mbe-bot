@@ -120,6 +120,7 @@ def process_and_reply(phone: str, text: str, message_id: str) -> None:
             time.sleep(remaining)
         # El cerebro puede devolver un texto o varios (lista de burbujas).
         for part in ([reply] if isinstance(reply, str) else reply):
+            print(f"[AGENTE] {phone}: {part}")
             send_whatsapp(phone, part)
 
     if handoff:
@@ -157,7 +158,7 @@ def webhook():
             return make_response("ok", 200)
 
         text = msg["text"]["body"].strip()
-        print(f"[MSG] {phone}: {text}")
+        print(f"[USUARIO] {phone}: {text}")
 
         # Si un humano tomó el control, el bot calla.
         if phone in ai.HUMAN_MODE:
