@@ -15,9 +15,10 @@ from google.genai import types
 
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Inicializa el cliente. Si existe GEMINI_API_KEY en el entorno, usa la API Key estándar.
+# Inicializa el cliente. Si existe una API Key válida (las de AI Studio empiezan con "AIza"), la usa.
 # De lo contrario, activa el modo Vertex AI para usar la Service Account (ADC).
-if os.environ.get("GEMINI_API_KEY"):
+api_key = os.environ.get("GEMINI_API_KEY", "")
+if api_key and api_key.strip().startswith("AIza"):
     client = genai.Client()
 else:
     client = genai.Client(vertex_ai=True)
