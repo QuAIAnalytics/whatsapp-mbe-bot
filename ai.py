@@ -21,7 +21,7 @@ api_key = os.environ.get("GEMINI_API_KEY", "")
 if api_key and api_key.strip().startswith("AIza"):
     client = genai.Client()
 else:
-    client = genai.Client(vertex_ai=True)
+    client = genai.Client(vertexai=True)
 
 # Historial en RAM (se borra al reiniciar). La clave es libre: cada cliente
 # usa algo como "mbe:5076..." para no mezclar conversaciones entre demos.
