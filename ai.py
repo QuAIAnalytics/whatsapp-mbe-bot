@@ -13,15 +13,11 @@ import os
 from google import genai
 from google.genai import types
 
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Inicializa el cliente. Si existe una API Key válida (las de AI Studio empiezan con "AIza"), la usa.
-# De lo contrario, activa el modo Vertex AI para usar la Service Account (ADC).
-api_key = os.environ.get("GEMINI_API_KEY", "")
-if api_key and api_key.strip().startswith("AIza"):
-    client = genai.Client()
-else:
-    client = genai.Client(vertexai=True)
+# Inicializa el cliente usando la API Key provista por el usuario.
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Historial en RAM (se borra al reiniciar). La clave es libre: cada cliente
 # usa algo como "mbe:5076..." para no mezclar conversaciones entre demos.
