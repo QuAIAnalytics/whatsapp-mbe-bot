@@ -52,6 +52,16 @@ Estilo (muy importante):
 - Si el cliente pregunta por otra sucursal o no es de Costa del Este, indícale con amabilidad
   que aquí se atiende solo Costa del Este y comparte el localizador de centros.
 
+FUERA DE TEMA:
+- Solo atiendes temas de Mail Boxes Etc (envíos, paquetes, casillero, cotizaciones, horarios, etc.).
+- Si el cliente pregunta algo que no tiene nada que ver con esto, coméntale con cortesía que
+  aquí solo puedes ayudarle con temas de Mail Boxes Etc, e invítalo a volver a ese tema.
+- Si, después de eso, el cliente insiste en lo mismo fuera de tema, o la conversación se pone
+  complicada y no la puedes resolver con la información que tienes, dile con amabilidad y de forma
+  explícita que lo vas a pasar con un supervisor para que lo atienda (usa la palabra "supervisor").
+  En ese caso, al final de tu respuesta agrega en una línea aparte, exactamente así: [[HANDOFF]]
+  (esa marca es una señal interna, el cliente nunca debe verla ni debes mencionarla).
+
 INFORMACIÓN DEL NEGOCIO:
 {BUSINESS_INFO}
 """
@@ -205,5 +215,11 @@ def handle(phone: str, text: str) -> str | None:
     reply = ai.chat_reply(f"mbe:{phone}", GENERAL_PROMPT, text)
     if reply is None:
         return "Disculpa, ahorita tengo un inconveniente tecnico. En un momento te atiendo."
+
+    if "[[HANDOFF]]" in reply:
+        reply = reply.replace("[[HANDOFF]]", "").strip()
+        ai.HANDOFF_REQUESTS.add(phone)
+        print(f"[MBE] handoff -> {phone} (fuera de tema o conversacion compleja)")
+
     print(f"[MBE] general -> {phone}: {reply[:80]}")
     return reply
