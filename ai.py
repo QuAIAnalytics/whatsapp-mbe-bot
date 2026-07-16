@@ -13,10 +13,11 @@ import os
 from google import genai
 from google.genai import types
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Inicializa el cliente. El SDK detecta automáticamente la variable GEMINI_API_KEY
+# en el entorno, o de lo contrario recurre a las credenciales por defecto (Service Account / ADC).
+client = genai.Client()
 
 # Historial en RAM (se borra al reiniciar). La clave es libre: cada cliente
 # usa algo como "mbe:5076..." para no mezclar conversaciones entre demos.
