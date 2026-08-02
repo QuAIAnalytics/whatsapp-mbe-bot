@@ -5,9 +5,13 @@ Flujo distinto al de QUAI:
 
     1. Saluda de forma natural y conversacional (sin menús ni opciones numeradas).
     2. Un "router" entiende, por lenguaje natural, si el cliente está preguntando
-       por el estado de sus paquetes.
-    3. Si es así -> un sub-agente liviano se conecta al Google Sheet y busca por el
-       número de WhatsApp del que escribe. (No carga el contexto del negocio: solo paquetes.)
+       por el estado de sus paquetes (usa el historial reciente para no perder
+       el hilo si el cliente ya está en medio de otro flujo, ej. una cotización).
+    3. Si es así -> primero se le pide el número de tracking/guía (no se manda el
+       detalle completo de una vez). Cuando el cliente responde con el tracking,
+       un sub-agente liviano busca ESE paquete puntual en el Google Sheet. Si el
+       cliente dice que no tiene el número a la mano, se hace de respaldo el
+       lookup por su número de WhatsApp (comportamiento anterior).
     4. Para cualquier otra cosa -> un asistente conversacional general de MBE, que
        responde con la info de negocio_mbe.txt.
 
@@ -33,10 +37,29 @@ BUSINESS_INFO = ai.load_info("MBE_INFO_PATH", "negocio_mbe.txt")
 # Teléfonos que ya recibieron el saludo inicial.
 GREETED: set[str] = set()
 
+# Teléfonos a los que ya se les pidió el tracking y estamos esperando su respuesta.
+# Solo se usa cuando no hay `history` (modo sin Chatwoot); con `history` el estado
+# se deriva del propio historial (ver `_bot_last_asked_tracking`), que es lo que
+# corre en producción (Cloud Run + Chatwoot) y sí sobrevive reinicios/instancias.
+WAITING_TRACKING: set[str] = set()
+
 # Saludo natural de primer contacto (cálido, sin menús ni opciones numeradas).
 WELCOME = (
     "Hola, qué tal. Te habla Gia de Mail Boxes Etc Costa del Este. "
     "¿En qué te puedo ayudar hoy?"
+)
+
+# Primera respuesta cuando el cliente pregunta por sus paquetes: se pide el
+# tracking antes de mandar cualquier detalle (punto 4 de fausto_cambios_v1.md).
+ASK_TRACKING_MSG = (
+    "Claro, ¿me compartes el número de tracking o guía del paquete? "
+    "Si no lo tienes a la mano, dime y lo reviso con tu número de teléfono."
+)
+
+# Frases con las que el cliente indica que no tiene el número de tracking a mano.
+NO_TRACKING_PHRASES = (
+    "no tengo", "no lo tengo", "no se", "no sé", "no cuento",
+    "no lo encuentro", "no lo tengo a la mano", "no tengo el numero", "no tengo el número",
 )
 
 # Asistente general (cuando NO está consultando paquetes).
@@ -62,21 +85,66 @@ FUERA DE TEMA:
   En ese caso, al final de tu respuesta agrega en una línea aparte, exactamente así: [[HANDOFF]]
   (esa marca es una señal interna, el cliente nunca debe verla ni debes mencionarla).
 
+COTIZACIÓN DE ENVÍO (muy importante, punto 2 de fausto_cambios_v1.md):
+- Para cotizar un envío necesitas exactamente estos 4 datos: (1) tipo de carga
+  (marítima o aérea), (2) peso del paquete, (3) volumen del paquete, (4) costo
+  del artículo incluyendo impuestos.
+- El cliente puede darte estos datos en mensajes separados (uno por mensaje, o
+  varios juntos). Antes de pedir el siguiente dato, revisa TODO el historial de
+  la conversación (no solo el último mensaje) para ver cuáles de los 4 ya te
+  dio, y no vuelvas a pedir uno que ya tienes.
+- En cada respuesta dentro de este flujo, ten claro mentalmente cuáles de los 4
+  datos ya tienes y cuáles faltan, y pide únicamente los que falten (uno o
+  varios a la vez, sin repetir los que ya te dieron).
+- No calcules ni des un estimado de costo tú mismo: cuando ya tengas los 4
+  datos, dile al cliente que ya tienes todo lo necesario y que le van a
+  confirmar el costo exacto, y haz handoff (ver "HANDOFF AUTOMÁTICO
+  ADICIONAL" abajo, punto de "cotización completa").
+
+HANDOFF AUTOMÁTICO ADICIONAL (punto 3 de fausto_cambios_v1.md):
+Además de la regla de "fuera de tema" de arriba, haz handoff automático
+(mismo mecanismo: agrega [[HANDOFF]] en una línea aparte al final de tu
+respuesta) en estos dos casos:
+- Bucle o pregunta repetida: si, revisando el historial, notas que estás por
+  volver a pedir un dato que el cliente ya te dio antes, o que te vas a repetir
+  preguntando lo mismo sin avanzar (estás "atascado" dentro del mismo tema, no
+  fuera de tema), no insistas ni repitas la pregunta. En su lugar, dile con
+  amabilidad que lo vas a pasar con un supervisor y agrega [[HANDOFF]].
+- Cotización completa: en cuanto tengas los 4 datos de la cotización de envío
+  (tipo de carga, peso, volumen, costo del artículo), no sigas conversando ni
+  inventes un estimado; avísale al cliente que ya tienes todo lo necesario y
+  que le van a confirmar el costo exacto, y agrega [[HANDOFF]] en esa misma
+  respuesta.
+
 INFORMACIÓN DEL NEGOCIO:
 {BUSINESS_INFO}
 """
 
 # Router de intención: detecta, por lenguaje natural, si pregunta por sus paquetes.
-ROUTER_PROMPT = """Lees el mensaje de un cliente de una empresa de paqueteria y decides su intencion.
-Responde UNA sola palabra, sin explicar:
+ROUTER_PROMPT = """Lees el mensaje mas reciente de un cliente de una empresa de paqueteria,
+junto con el historial reciente de la conversacion (si lo hay), y decides la intencion de
+ESE mensaje nuevo. Responde UNA sola palabra, sin explicar:
 - PACKAGES  si quiere saber por el estado, ubicacion, llegada o seguimiento de sus paquetes,
             pedidos o envios (ej: "llego mi paquete?", "donde esta mi envio", "tengo algo pendiente?").
-- OTHER     para cualquier otra cosa (saludos, dudas de servicios, horarios, precios, etc).
+- OTHER     para cualquier otra cosa (saludos, dudas de servicios, horarios, cotizaciones, precios, etc).
+
+Importante - no reclasifiques a mitad de un flujo ya en curso: si el historial muestra que
+ya hay una conversacion activa sobre otro tema (por ejemplo una cotizacion de envio donde se
+estan recolectando datos como tipo de carga, peso, volumen o costo), y el mensaje nuevo es
+ambiguo o solo menciona de pasada una palabra relacionada con "paquete" o "envio", NO lo
+clasifiques como PACKAGES: responde OTHER para que esa conversacion continue sin perder el
+hilo. Responde PACKAGES unicamente cuando el cliente este preguntando, sin ambiguedad, por el
+estado o rastreo de un envio.
 """
 
 
-def _classify(text: str) -> str:
-    answer = (ai.ask_once(ROUTER_PROMPT, text) or "").upper()
+def _classify(text: str, history: list | None = None) -> str:
+    prompt_text = text
+    if history:
+        recent = history[-6:]
+        convo = "\n".join(f"{h['role']}: {h['text']}" for h in recent)
+        prompt_text = f"Historial reciente:\n{convo}\n\nMensaje nuevo del cliente: {text}"
+    answer = (ai.ask_once(ROUTER_PROMPT, prompt_text) or "").upper()
     return "PACKAGES" if "PACKAGES" in answer else "OTHER"
 
 
@@ -147,7 +215,40 @@ def _fetch_packages(phone: str) -> list[dict] | None:
     return rows
 
 
+def _format_package_block(row: dict, index: int | None = None) -> tuple[str, float | None]:
+    """Arma el bloque de texto de un paquete. Devuelve (texto, total_a_pagar_o_None).
+
+    Los montos se calculan aquí (deterministas): impuesto = neto * 7%,
+    total a pagar = neto + impuesto.
+    """
+    tracking = _find(row, TRACKING_KEYS) or "sin tracking"
+    estado   = _find(row, ESTADO_KEYS) or "sin estado"
+    volumen  = _find(row, VOLUMEN_KEYS)
+    peso     = _find(row, PESO_KEYS)
+    neto     = _parse_money(_find(row, COSTO_KEYS))
+
+    lines = [f"Paquete {index}"] if index is not None else []
+    lines.append(f"- Tracking: {tracking}")
+    lines.append(f"- Estado: {estado}")
+    if volumen:
+        lines.append(f"- Volumen: {volumen}")
+    if peso:
+        lines.append(f"- Peso: {peso}")
+
+    total = None
+    if neto is not None:
+        impuesto = round(neto * IMPUESTO_RATE, 2)
+        total = round(neto + impuesto, 2)
+        lines.append(f"- Costo total neto: ${neto:,.2f}")
+        lines.append(f"- Impuesto (7%): ${impuesto:,.2f}")
+        lines.append(f"- Costo total a pagar: ${total:,.2f}")
+    return "\n".join(lines), total
+
+
 def _packages_reply(phone: str) -> str:
+    """Respaldo: busca todos los paquetes por número de teléfono (comportamiento
+    anterior). Se usa solo cuando el cliente dice que no tiene el tracking a mano.
+    """
     try:
         rows = _fetch_packages(phone)
     except Exception as e:
@@ -160,40 +261,86 @@ def _packages_reply(phone: str) -> str:
         return ("Reviso y no veo paquetes a nombre de este numero. "
                 "Si crees que deberia haber algo, llamanos al (507) 271-5975 y lo verificamos.")
 
-    # Armamos un bloque por paquete. Los montos se calculan aquí (deterministas):
-    # impuesto = neto * 7%, total a pagar = neto + impuesto.
     blocks: list[str] = []
     grand_total = 0.0
     hay_costos = False
-
     for i, row in enumerate(rows, 1):
-        tracking = _find(row, TRACKING_KEYS) or "sin tracking"
-        estado   = _find(row, ESTADO_KEYS) or "sin estado"
-        volumen  = _find(row, VOLUMEN_KEYS)
-        peso     = _find(row, PESO_KEYS)
-        neto     = _parse_money(_find(row, COSTO_KEYS))
-
-        lines = [f"Paquete {i}"]
-        lines.append(f"- Tracking: {tracking}")
-        lines.append(f"- Estado: {estado}")
-        if volumen:
-            lines.append(f"- Volumen: {volumen}")
-        if peso:
-            lines.append(f"- Peso: {peso}")
-        if neto is not None:
-            impuesto = round(neto * IMPUESTO_RATE, 2)
-            total = round(neto + impuesto, 2)
+        block, total = _format_package_block(row, index=i)
+        blocks.append(block)
+        if total is not None:
             grand_total += total
             hay_costos = True
-            lines.append(f"- Costo total neto: ${neto:,.2f}")
-            lines.append(f"- Impuesto (7%): ${impuesto:,.2f}")
-            lines.append(f"- Costo total a pagar: ${total:,.2f}")
-        blocks.append("\n".join(lines))
 
     msg = "Esto es lo que veo a tu nombre:\n\n" + "\n\n".join(blocks)
     if hay_costos and len(rows) > 1:
         msg += f"\n\nEl total a cancelar por todos sus paquetes es ${grand_total:,.2f}"
     return msg
+
+
+def _fetch_by_tracking(tracking: str) -> list[dict] | None:
+    """Busca en el Sheet (CSV) por número de tracking/guía.
+
+    Devuelve None si el Sheet no está configurado. Lanza excepción si falla la red.
+    Prioriza coincidencia exacta; si no hay, busca coincidencia parcial (por si el
+    cliente omite guiones o manda solo una parte del número).
+    """
+    url = os.environ.get("MBE_SHEET_CSV_URL", "")
+    if not url:
+        return None
+
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+
+    query = "".join((tracking or "").split()).lower()
+
+    def _norm_tracking(row: dict) -> str | None:
+        value = _find(row, TRACKING_KEYS)
+        return "".join(value.split()).lower() if value else None
+
+    exact = [row for row in rows if _norm_tracking(row) == query]
+    if exact:
+        return exact
+    return [row for row in rows if (_norm_tracking(row) or "") and query in _norm_tracking(row)]
+
+
+def _looks_like_no_tracking(text: str) -> bool:
+    t = (text or "").lower()
+    return any(phrase in t for phrase in NO_TRACKING_PHRASES)
+
+
+def _tracking_followup_reply(phone: str, text: str) -> str:
+    """Responde al mensaje del cliente después de que se le pidió el tracking."""
+    if _looks_like_no_tracking(text):
+        return _packages_reply(phone)
+
+    try:
+        rows = _fetch_by_tracking(text)
+    except Exception as e:
+        print(f"[MBE] error leyendo Sheet (tracking): {e}")
+        return "Disculpa, ahorita no pude revisar el sistema. Dame unos minutos y lo vemos de nuevo."
+
+    if rows is None:
+        return "Disculpa, ahorita no puedo revisar el estado de los paquetes. Llamanos al (507) 271-5975 y te ayudamos."
+    if not rows:
+        # No se encontró ese tracking: en vez de pedirle que lo confirme (lo que
+        # rompía el estado "esperando tracking" si volvía a fallar), se pasa
+        # directo con una persona.
+        ai.HANDOFF_REQUESTS.add(phone)
+        return ("No encuentro ese tracking en el sistema. Te voy a pasar con alguien del equipo "
+                "para que te ayude con esto.")
+
+    block, _ = _format_package_block(rows[0])
+    return "Esto es lo que veo con ese tracking:\n\n" + block
+
+
+def _bot_last_asked_tracking(history: list) -> bool:
+    """True si el último mensaje del bot en el historial fue pedir el tracking,
+    es decir, si el cliente está respondiendo a esa pregunta."""
+    if not history:
+        return False
+    last = history[-1]
+    return last.get("role") == "model" and ASK_TRACKING_MSG in (last.get("text") or "")
 
 
 def handle(phone: str, text: str, history: list | None = None) -> str | None:
@@ -202,8 +349,27 @@ def handle(phone: str, text: str, history: list | None = None) -> str | None:
     `history`: si viene (modo Chatwoot, reconstruido desde la conversación real,
     que ya es persistente), se usa para decidir "¿ya lo saludé?" y como memoria
     del chat, en vez de los sets/diccionarios en RAM (`GREETED`, `ai.SESSIONS`).
+    También se le pasa al router (`_classify`) para que no reclasifique a mitad
+    de un flujo ya en curso (ej. una cotización) solo porque el mensaje nuevo
+    menciona algo ambiguo relacionado con paquetes.
+
+    El estado "le acabo de pedir el tracking, esta es su respuesta" se deriva
+    del propio `history` (`_bot_last_asked_tracking`) en vez de guardarse aparte:
+    así sobrevive a que Cloud Run reinicie o escale a otra instancia. Cuando no
+    hay `history` (modo directo, sin Chatwoot) se usa `WAITING_TRACKING` en RAM
+    como respaldo, igual que `GREETED`.
     """
-    intent = _classify(text)
+    waiting_tracking = (
+        _bot_last_asked_tracking(history) if history is not None else phone in WAITING_TRACKING
+    )
+    if waiting_tracking:
+        if history is None:
+            WAITING_TRACKING.discard(phone)
+        reply = _tracking_followup_reply(phone, text)
+        print(f"[MBE] tracking -> {phone}: {reply[:80]}")
+        return reply
+
+    intent = _classify(text, history)
     if history is not None:
         first_time = len(history) == 0
     else:
@@ -212,9 +378,10 @@ def handle(phone: str, text: str, history: list | None = None) -> str | None:
             GREETED.add(phone)
 
     if intent == "PACKAGES":
-        reply = _packages_reply(phone)
-        print(f"[MBE] paquetes -> {phone}: {reply[:80]}")
-        return reply
+        if history is None:
+            WAITING_TRACKING.add(phone)
+        print(f"[MBE] paquetes -> {phone}: pidiendo tracking")
+        return ASK_TRACKING_MSG
 
     # Primer contacto sin intención de paquetes: saludo natural.
     if first_time:

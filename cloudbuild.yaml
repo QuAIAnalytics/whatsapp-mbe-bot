@@ -1,3 +1,4 @@
+
 # CI/CD: en cada push a main, Cloud Build reconstruye la imagen y actualiza
 # el servicio de Cloud Run. Los env vars/secretos NO se tocan aquí (los pones
 # una vez a mano al crear el servicio o con `gcloud run services update`).
