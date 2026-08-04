@@ -37,9 +37,17 @@ WA_PHONE_ID     = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WA_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "bea-verify-2026")
 WA_API_VERSION  = os.environ.get("WHATSAPP_API_VERSION", "v22.0")
 
-# Para que la respuesta se sienta humana: muestra "escribiendo..." y demora un poco.
-TYPING_MIN_SECONDS = float(os.environ.get("TYPING_MIN_SECONDS", "5"))
-TYPING_MAX_SECONDS = float(os.environ.get("TYPING_MAX_SECONDS", "20"))
+# Para que la respuesta se sienta humana: muestra "escribiendo..." y demora un poco
+# (encima del debounce de abajo, así que se mantiene corto para no sumar demasiado).
+TYPING_MIN_SECONDS = float(os.environ.get("TYPING_MIN_SECONDS", "2"))
+TYPING_MAX_SECONDS = float(os.environ.get("TYPING_MAX_SECONDS", "8"))
+
+# Si el cliente manda varios mensajes seguidos ("mensajes en cadena"), esperamos
+# este tiempo desde el último mensaje antes de procesarlos, para juntarlos y
+# responder una sola vez en vez de contestar cada uno por separado (lo que
+# además puede generar dos respuestas corriendo en paralelo sobre el mismo
+# historial y perder contexto entre sí).
+DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "15"))
 
 # Cerebro activo (Bea para QUAI, asistente de paquetes para MBE, ...).
 handle_message = get_handler()
@@ -128,6 +136,38 @@ def process_and_reply(phone: str, text: str, message_id: str) -> None:
         print(f"[HITL] {phone} pasado a modo humano (decidido por el cerebro)")
 
 
+# Buffer de mensajes en cadena por teléfono (modo WhatsApp directo, sin Chatwoot).
+_pending_lock = threading.Lock()
+_pending_wa: dict[str, list[str]] = {}
+_pending_wa_timers: dict[str, threading.Timer] = {}
+
+
+def _flush_whatsapp(phone: str, message_id: str) -> None:
+    """Se dispara cuando pasan DEBOUNCE_SECONDS sin mensajes nuevos de este
+    teléfono: junta todo lo acumulado y lo procesa como un solo turno."""
+    with _pending_lock:
+        texts = _pending_wa.pop(phone, [])
+        _pending_wa_timers.pop(phone, None)
+    if not texts:
+        return
+    process_and_reply(phone, "\n".join(texts), message_id)
+
+
+def _queue_whatsapp(phone: str, text: str, message_id: str) -> None:
+    """Acumula el mensaje y reinicia el temporizador de espera. Si llegan más
+    mensajes antes de que se cumpla DEBOUNCE_SECONDS, se van sumando y el
+    temporizador se reinicia, así que todos se procesan juntos al final."""
+    with _pending_lock:
+        _pending_wa.setdefault(phone, []).append(text)
+        old_timer = _pending_wa_timers.get(phone)
+        if old_timer:
+            old_timer.cancel()
+        timer = threading.Timer(DEBOUNCE_SECONDS, _flush_whatsapp, args=(phone, message_id))
+        timer.daemon = True
+        _pending_wa_timers[phone] = timer
+        timer.start()
+
+
 # ── WEBHOOK ──────────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
@@ -165,13 +205,11 @@ def webhook():
             print(f"[HITL] {phone} en modo humano — el bot calla")
             return make_response("ok", 200)
 
-        # Procesamos en segundo plano (mostrar "escribiendo...", demorar, responder)
-        # para devolverle 200 a Meta de inmediato y que no reintente.
-        threading.Thread(
-            target=process_and_reply,
-            args=(phone, text, msg.get("id", "")),
-            daemon=True,
-        ).start()
+        # Mostramos "escribiendo..." de inmediato, pero el procesamiento real se
+        # agrupa con cualquier mensaje en cadena que llegue en los próximos
+        # DEBOUNCE_SECONDS (ver _queue_whatsapp) para responder una sola vez.
+        send_typing(msg.get("id", ""))
+        _queue_whatsapp(phone, text, msg.get("id", ""))
 
     except Exception as e:
         print(f"[WEBHOOK] ERROR: {e}")
@@ -239,11 +277,13 @@ if CHATWOOT_ENABLED:
         except Exception as e:
             print(f"[CHATWOOT] handoff ERROR: {e}")
 
-    def cw_fetch_history(conversation_id: int, exclude_id, limit: int = 15) -> list:
+    def cw_fetch_history(conversation_id: int, exclude_ids=None, limit: int = 15) -> list:
         """Trae los últimos mensajes de la conversación (ya persistidos en Chatwoot)
-        y los arma como historial para el cerebro, excluyendo el mensaje que
-        disparó este webhook (para no duplicarlo en la memoria).
+        y los arma como historial para el cerebro, excluyendo los mensajes que
+        disparon este turno (pueden ser varios si el cliente mandó mensajes en
+        cadena y se agruparon, ver _queue_chatwoot).
         """
+        exclude_ids = set(exclude_ids or ())
         try:
             r = requests.get(
                 f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/messages",
@@ -255,9 +295,15 @@ if CHATWOOT_ENABLED:
             print(f"[CHATWOOT] history ERROR: {e}")
             return []
 
+        # La API de Chatwoot no garantiza orden ascendente (normalmente devuelve
+        # los mensajes más recientes primero, pensado para paginar hacia atrás).
+        # Ordenamos explícitamente por fecha para no armar el historial al revés
+        # o cortarlo del lado equivocado con `history[-limit:]`.
+        payload = sorted(payload, key=lambda m: m.get("created_at") or 0)
+
         history = []
         for m in payload:
-            if m.get("id") == exclude_id:
+            if m.get("id") in exclude_ids:
                 continue
             content = (m.get("content") or "").strip()
             # message_type: 0 = incoming (cliente), 1 = outgoing (bot/agente).
@@ -267,12 +313,12 @@ if CHATWOOT_ENABLED:
             history.append({"role": role, "text": content})
         return history[-limit:]
 
-    def cw_process(conversation_id: int, phone: str, text: str, message_id: str = "", cw_message_id=None) -> None:
+    def cw_process(conversation_id: int, phone: str, text: str, message_id: str = "", exclude_ids=None) -> None:
         """Corre el cerebro y responde por Chatwoot, en segundo plano (igual que WhatsApp)."""
         start = time.time()
         # Muestra "escribiendo..." en WhatsApp usando el id (wamid) del mensaje entrante.
         send_typing(message_id)
-        history = cw_fetch_history(conversation_id, cw_message_id)
+        history = cw_fetch_history(conversation_id, exclude_ids)
         reply = handle_message(phone, text, history=history)
         # Si el cerebro pidió pasar con una persona, lo recogemos para el handoff en Chatwoot.
         handoff = phone in ai.HANDOFF_REQUESTS
@@ -299,6 +345,37 @@ if CHATWOOT_ENABLED:
             meta = ((data.get("conversation") or {}).get("meta") or {})
             phone = (meta.get("sender") or {}).get("phone_number", "")
         return (phone or "").lstrip("+")
+
+    # Buffer de mensajes en cadena por conversación (mismo patrón que _pending_wa
+    # para WhatsApp directo, ver arriba).
+    _pending_cw_lock = threading.Lock()
+    _pending_cw_texts: dict[int, list[str]] = {}
+    _pending_cw_ids: dict[int, list] = {}
+    _pending_cw_timers: dict[int, threading.Timer] = {}
+
+    def _flush_chatwoot(conversation_id: int, phone: str, message_id: str) -> None:
+        """Se dispara cuando pasan DEBOUNCE_SECONDS sin mensajes nuevos en esta
+        conversación: junta todo lo acumulado y lo procesa como un solo turno."""
+        with _pending_cw_lock:
+            texts = _pending_cw_texts.pop(conversation_id, [])
+            ids = _pending_cw_ids.pop(conversation_id, [])
+            _pending_cw_timers.pop(conversation_id, None)
+        if not texts:
+            return
+        cw_process(conversation_id, phone, "\n".join(texts), message_id, exclude_ids=ids)
+
+    def _queue_chatwoot(conversation_id: int, phone: str, text: str, message_id: str, cw_message_id) -> None:
+        """Acumula el mensaje y reinicia el temporizador de espera (ver _queue_whatsapp)."""
+        with _pending_cw_lock:
+            _pending_cw_texts.setdefault(conversation_id, []).append(text)
+            _pending_cw_ids.setdefault(conversation_id, []).append(cw_message_id)
+            old_timer = _pending_cw_timers.get(conversation_id)
+            if old_timer:
+                old_timer.cancel()
+            timer = threading.Timer(DEBOUNCE_SECONDS, _flush_chatwoot, args=(conversation_id, phone, message_id))
+            timer.daemon = True
+            _pending_cw_timers[conversation_id] = timer
+            timer.start()
 
     @app.route("/chatwoot", methods=["POST"])
     def chatwoot_webhook():
@@ -353,11 +430,11 @@ if CHATWOOT_ENABLED:
         message_id = data.get("source_id") or ""
         cw_message_id = data.get("id")
         print(f"[CHATWOOT] conv {conversation_id} ({phone}) wamid={message_id or '∅'}: {text}")
-        threading.Thread(
-            target=cw_process,
-            args=(conversation_id, phone, text, message_id, cw_message_id),
-            daemon=True,
-        ).start()
+        # Mostramos "escribiendo..." de inmediato, pero el procesamiento real se
+        # agrupa con cualquier mensaje en cadena que llegue en los próximos
+        # DEBOUNCE_SECONDS (ver _queue_chatwoot) para responder una sola vez.
+        send_typing(message_id)
+        _queue_chatwoot(conversation_id, phone, text, message_id, cw_message_id)
         return make_response("ok", 200)
 else:
     print("[BOOT] CHATWOOT=false — ruta /chatwoot deshabilitada, solo WhatsApp directo")
