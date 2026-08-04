@@ -74,6 +74,9 @@ Estilo (muy importante):
 - No inventes precios, plazos ni datos que no estén abajo. Si no lo sabes o no tienes la información, no digas que es un error; simplemente indícale amablemente al cliente que vas a elevar su consulta con el área correspondiente para que le den seguimiento.
 - Si el cliente pregunta por otra sucursal o no es de Costa del Este, indícale con amabilidad
   que aquí se atiende solo Costa del Este y comparte el localizador de centros.
+- Si el historial de la conversación está vacío (es la primera vez que te escribe este cliente),
+  empieza tu respuesta con un saludo breve, presentándote como parte del equipo de Mail Boxes
+  Etc Costa del Este, antes de atender lo que te está preguntando.
 
 FUERA DE TEMA:
 - Solo atiendes temas de Mail Boxes Etc (envíos, paquetes, casillero, cotizaciones, horarios, etc.).
@@ -126,7 +129,10 @@ junto con el historial reciente de la conversacion (si lo hay), y decides la int
 ESE mensaje nuevo. Responde UNA sola palabra, sin explicar:
 - PACKAGES  si quiere saber por el estado, ubicacion, llegada o seguimiento de sus paquetes,
             pedidos o envios (ej: "llego mi paquete?", "donde esta mi envio", "tengo algo pendiente?").
-- OTHER     para cualquier otra cosa (saludos, dudas de servicios, horarios, cotizaciones, precios, etc).
+- GREETING  si el mensaje es solo un saludo o cortesia, sin ninguna pregunta o pedido real
+            (ej: "hola", "buenas", "que tal", "buenos dias").
+- OTHER     para cualquier otra cosa con una pregunta o pedido real (dudas de servicios,
+            horarios, cotizaciones, precios, etc), aunque venga acompañado de un saludo.
 
 Importante - no reclasifiques a mitad de un flujo ya en curso: si el historial muestra que
 ya hay una conversacion activa sobre otro tema (por ejemplo una cotizacion de envio donde se
@@ -145,7 +151,11 @@ def _classify(text: str, history: list | None = None) -> str:
         convo = "\n".join(f"{h['role']}: {h['text']}" for h in recent)
         prompt_text = f"Historial reciente:\n{convo}\n\nMensaje nuevo del cliente: {text}"
     answer = (ai.ask_once(ROUTER_PROMPT, prompt_text) or "").upper()
-    return "PACKAGES" if "PACKAGES" in answer else "OTHER"
+    if "PACKAGES" in answer:
+        return "PACKAGES"
+    if "GREETING" in answer:
+        return "GREETING"
+    return "OTHER"
 
 
 def _only_digits(value: str) -> str:
@@ -383,8 +393,10 @@ def handle(phone: str, text: str, history: list | None = None) -> str | None:
         print(f"[MBE] paquetes -> {phone}: pidiendo tracking")
         return ASK_TRACKING_MSG
 
-    # Primer contacto sin intención de paquetes: saludo natural.
-    if first_time:
+    # Primer contacto que es solo un saludo (sin pregunta ni pedido real):
+    # saludo natural. Si el primer mensaje ya trae una intención real (ej.
+    # "quiero cotizar un envío"), se atiende directo, sin descartarlo.
+    if first_time and intent == "GREETING":
         return WELCOME
 
     reply = ai.chat_reply(f"mbe:{phone}", GENERAL_PROMPT, text, history=history)
