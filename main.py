@@ -375,7 +375,7 @@ if CHATWOOT_ENABLED:
                 cw_send(conversation_id, part)
 
         if handoff:
-            _CW_HANDOFF[conversation_id] = time.time()
+            _cw_go_silent(conversation_id)
             cw_handoff(conversation_id)
             print(f"[CHATWOOT] handoff conv {conversation_id} (decidido por el cerebro)")
 
@@ -394,6 +394,32 @@ if CHATWOOT_ENABLED:
     _pending_cw_texts: dict[int, list[str]] = {}
     _pending_cw_ids: dict[int, list] = {}
     _pending_cw_timers: dict[int, threading.Timer] = {}
+
+    def _cw_go_silent(conversation_id: int) -> None:
+        """Marca la conversación como 'en modo humano' y cancela cualquier
+        mensaje en cadena que estuviera esperando el debounce, para que el
+        bot no conteste después de que ya se pasó (o alguien más ya tomó) el
+        control. Se llama tanto cuando el handoff lo decidimos nosotros
+        (palabra clave, bucle, cotización completa) como cuando un agente
+        humano contesta manualmente desde Chatwoot (ver chatwoot_webhook)."""
+        _CW_HANDOFF[conversation_id] = time.time()
+        with _pending_cw_lock:
+            _pending_cw_texts.pop(conversation_id, None)
+            _pending_cw_ids.pop(conversation_id, None)
+            timer = _pending_cw_timers.pop(conversation_id, None)
+        if timer:
+            timer.cancel()
+
+    def _cw_sent_by_human_agent(data: dict) -> bool:
+        """True si un mensaje saliente lo mandó un agente humano real desde
+        Chatwoot, no nuestro Agent Bot (asume que CHATWOOT_API_TOKEN es un
+        token de Agent Bot dedicado, no la cuenta personal de un agente —
+        si no, Chatwoot no puede distinguir uno de otro)."""
+        sender_type = (data.get("sender_type") or "").lower()
+        if sender_type:
+            return sender_type == "user"
+        nested = ((data.get("sender") or {}).get("type") or "").lower()
+        return nested == "user"
 
     def _flush_chatwoot(conversation_id: int, phone: str, message_id: str) -> None:
         """Se dispara cuando pasan DEBOUNCE_SECONDS sin mensajes nuevos en esta
@@ -435,6 +461,15 @@ if CHATWOOT_ENABLED:
                 _CW_HANDOFF.pop(conversation_id, None)
             return make_response("ok", 200)
 
+        # Un agente humano contestó manualmente desde Chatwoot (no nuestro
+        # Agent Bot): tratamos eso como handoff inmediato, sin esperar a que
+        # nosotros mismos lo disparemos por algún otro camino.
+        if event == "message_created" and data.get("message_type") == "outgoing":
+            if conversation_id and _cw_sent_by_human_agent(data):
+                _cw_go_silent(conversation_id)
+                print(f"[CHATWOOT] conv {conversation_id}: agente humano contestó, bot en silencio")
+            return make_response("ok", 200)
+
         # Solo nos interesan mensajes nuevos ENTRANTES (del cliente), no los salientes/bot.
         if event != "message_created" or data.get("message_type") != "incoming":
             return make_response("ok", 200)
@@ -468,7 +503,7 @@ if CHATWOOT_ENABLED:
         _CW_LAST[conversation_id] = norm
 
         if pide_humano or repitio:
-            _CW_HANDOFF[conversation_id] = time.time()
+            _cw_go_silent(conversation_id)
             razon = "lo pidió" if pide_humano else "repitió mensaje"
             print(f"[CHATWOOT] handoff conv {conversation_id} ({razon})")
             cw_send(conversation_id, HANDOFF_REPLY)
