@@ -19,6 +19,8 @@ import os
 import random
 import threading
 import time
+from collections import deque
+
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, make_response
@@ -52,6 +54,38 @@ DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "15"))
 # Cerebro activo (Bea para QUAI, asistente de paquetes para MBE, ...).
 handle_message = get_handler()
 print("[BOOT] cliente=MBE")
+
+
+def _make_seen_tracker(maxlen: int = 2000):
+    """Crea un detector de IDs ya vistos (acotado, sin crecer para siempre).
+
+    Meta y Chatwoot pueden reintentar la entrega del mismo evento si no
+    respondemos rápido (o por cualquier reintento de red); sin esto,
+    procesaríamos el mismo mensaje dos veces y contestaríamos duplicado.
+    Devuelve una función `mark_if_new(key) -> bool`: True la primera vez que
+    ve ese id, False si ya lo había visto antes (y no hace nada más).
+    """
+    seen: set = set()
+    order: deque = deque()
+
+    def mark_if_new(key) -> bool:
+        if not key:
+            return True   # sin id no podemos deduplicar; seguimos como antes
+        if key in seen:
+            return False
+        seen.add(key)
+        order.append(key)
+        if len(order) > maxlen:
+            seen.discard(order.popleft())
+        return True
+
+    return mark_if_new
+
+
+# Un tracker separado por canal: los IDs de WhatsApp y los de Chatwoot viven
+# en espacios de nombres distintos, no tiene sentido compartir el set.
+_wa_seen = _make_seen_tracker()
+_cw_seen = _make_seen_tracker()
 
 
 # ── ENVIAR POR WHATSAPP ─────────────────────────────────────────────────────────
@@ -194,6 +228,12 @@ def webhook():
         # los procesamos todos, no solo el primero, para no perder ninguno.
         for msg in messages:
             phone = msg["from"]                   # numero internacional sin "+", ej. 5076...
+
+            # Reintento de Meta del mismo mensaje: lo ignoramos por completo,
+            # ni siquiera lo mostramos como si fuera nuevo.
+            if not _wa_seen(msg.get("id", "")):
+                print(f"[WEBHOOK] mensaje duplicado ignorado ({phone})")
+                continue
 
             if msg.get("type") != "text":
                 send_whatsapp(phone, "Por ahora solo puedo leer mensajes de texto.")
@@ -401,6 +441,14 @@ if CHATWOOT_ENABLED:
 
         text = (data.get("content") or "").strip()
         if not conversation_id or not text:
+            return make_response("ok", 200)
+
+        # Reintento del mismo evento de Chatwoot: se ignora antes de tocar
+        # cualquier otro estado (handoff, detector de repetidos, etc.), para
+        # que un reintento técnico nunca se confunda con que el cliente
+        # repitió su mensaje por frustración.
+        if not _cw_seen(data.get("id")):
+            print(f"[CHATWOOT] evento duplicado ignorado (conv {conversation_id})")
             return make_response("ok", 200)
 
         # ¿Está en modo humano? Si no han pasado las horas de "retomar", el bot calla.
