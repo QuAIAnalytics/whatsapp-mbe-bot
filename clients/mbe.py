@@ -26,6 +26,7 @@ Configuración (.env):
 import csv
 import io
 import os
+import re
 
 import requests
 
@@ -147,8 +148,13 @@ estado o rastreo de un envio.
 def _classify(text: str, history: list | None = None) -> str:
     prompt_text = text
     if history:
-        recent = history[-6:]
-        convo = "\n".join(f"{h['role']}: {h['text']}" for h in recent)
+        # Usamos la misma ventana que el resto del flujo (la que ya viene
+        # acotada a 15 mensajes desde cw_fetch_history), en vez de cortarla
+        # más todavía: si el router ve menos contexto que el flujo de
+        # cotización, puede "olvidar" que hay una cotización en curso antes
+        # que el resto del sistema y reclasificar mal (ver punto 1 de
+        # fausto_cambios_v1.md).
+        convo = "\n".join(f"{h['role']}: {h['text']}" for h in history)
         prompt_text = f"Historial reciente:\n{convo}\n\nMensaje nuevo del cliente: {text}"
     answer = (ai.ask_once(ROUTER_PROMPT, prompt_text) or "").upper()
     if "PACKAGES" in answer:
@@ -287,12 +293,25 @@ def _packages_reply(phone: str) -> str:
     return msg
 
 
-def _fetch_by_tracking(tracking: str) -> list[dict] | None:
-    """Busca en el Sheet (CSV) por número de tracking/guía.
+# Heurística genérica para reconocer un tracking dentro de texto libre (letras,
+# números y guiones, de al menos 5 caracteres). Sirve para no exigir que el
+# mensaje completo sea EXACTAMENTE el tracking: lo encuentra aunque venga
+# mezclado con otras palabras, o con otro mensaje pegado por el agrupado de
+# mensajes en cadena (ver TODO.md: ajustar esto al formato real de tracking
+# del negocio en cuanto lo tengamos, ej. largo fijo o prefijo conocido).
+_TRACKING_CANDIDATE_RE = re.compile(r"[A-Za-z0-9-]{5,}")
 
-    Devuelve None si el Sheet no está configurado. Lanza excepción si falla la red.
-    Prioriza coincidencia exacta; si no hay, busca coincidencia parcial (por si el
-    cliente omite guiones o manda solo una parte del número).
+
+def _extract_tracking_candidates(text: str) -> list[str]:
+    return _TRACKING_CANDIDATE_RE.findall(text or "")
+
+
+def _fetch_by_tracking_candidates(candidates: list[str]) -> list[dict] | None:
+    """Descarga el Sheet (CSV) una sola vez y prueba cada candidato de
+    tracking en orden contra sus filas. Devuelve las filas del primer
+    candidato que coincida (exacto o parcial), o [] si ninguno coincidió.
+    Devuelve None si el Sheet no está configurado. Lanza excepción si falla
+    la red.
     """
     url = os.environ.get("MBE_SHEET_CSV_URL", "")
     if not url:
@@ -302,16 +321,21 @@ def _fetch_by_tracking(tracking: str) -> list[dict] | None:
     r.raise_for_status()
     rows = list(csv.DictReader(io.StringIO(r.text)))
 
-    query = "".join((tracking or "").split()).lower()
-
     def _norm_tracking(row: dict) -> str | None:
         value = _find(row, TRACKING_KEYS)
         return "".join(value.split()).lower() if value else None
 
-    exact = [row for row in rows if _norm_tracking(row) == query]
-    if exact:
-        return exact
-    return [row for row in rows if (_norm_tracking(row) or "") and query in _norm_tracking(row)]
+    for candidate in candidates:
+        query = "".join((candidate or "").split()).lower()
+        if not query:
+            continue
+        exact = [row for row in rows if _norm_tracking(row) == query]
+        if exact:
+            return exact
+        partial = [row for row in rows if (_norm_tracking(row) or "") and query in _norm_tracking(row)]
+        if partial:
+            return partial
+    return []
 
 
 def _looks_like_no_tracking(text: str) -> bool:
@@ -320,28 +344,37 @@ def _looks_like_no_tracking(text: str) -> bool:
 
 
 def _tracking_followup_reply(phone: str, text: str) -> str:
-    """Responde al mensaje del cliente después de que se le pidió el tracking."""
-    if _looks_like_no_tracking(text):
-        return _packages_reply(phone)
+    """Responde al mensaje del cliente después de que se le pidió el tracking.
+
+    Primero intenta encontrar un tracking real dentro del texto (aunque venga
+    mezclado con otras palabras o mensajes agrupados); solo si ninguno
+    coincide con el Sheet interpreta que el cliente no lo tiene a la mano, o
+    que no se encontró.
+    """
+    candidates = _extract_tracking_candidates(text) or [text]
 
     try:
-        rows = _fetch_by_tracking(text)
+        rows = _fetch_by_tracking_candidates(candidates)
     except Exception as e:
         print(f"[MBE] error leyendo Sheet (tracking): {e}")
         return "Disculpa, ahorita no pude revisar el sistema. Dame unos minutos y lo vemos de nuevo."
 
     if rows is None:
         return "Disculpa, ahorita no puedo revisar el estado de los paquetes. Llamanos al (507) 271-5975 y te ayudamos."
-    if not rows:
-        # No se encontró ese tracking: en vez de pedirle que lo confirme (lo que
-        # rompía el estado "esperando tracking" si volvía a fallar), se pasa
-        # directo con una persona.
-        ai.HANDOFF_REQUESTS.add(phone)
-        return ("No encuentro ese tracking en el sistema. Te voy a pasar con alguien del equipo "
-                "para que te ayude con esto.")
 
-    block, _ = _format_package_block(rows[0])
-    return "Esto es lo que veo con ese tracking:\n\n" + block
+    if rows:
+        block, _ = _format_package_block(rows[0])
+        return "Esto es lo que veo con ese tracking:\n\n" + block
+
+    if _looks_like_no_tracking(text):
+        return _packages_reply(phone)
+
+    # No se encontró ningún candidato: en vez de pedirle que lo confirme (lo
+    # que rompía el estado "esperando tracking" si volvía a fallar), se pasa
+    # directo con una persona.
+    ai.HANDOFF_REQUESTS.add(phone)
+    return ("No encuentro ese tracking en el sistema. Te voy a pasar con alguien del equipo "
+            "para que te ayude con esto.")
 
 
 def _bot_last_asked_tracking(history: list) -> bool:
