@@ -190,26 +190,28 @@ def webhook():
         if not messages:
             return make_response("ok", 200)   # eventos de estado (entregado/leido)
 
-        msg   = messages[0]
-        phone = msg["from"]                   # numero internacional sin "+", ej. 5076...
+        # Meta puede entregar más de un mensaje en el mismo payload (bajo carga);
+        # los procesamos todos, no solo el primero, para no perder ninguno.
+        for msg in messages:
+            phone = msg["from"]                   # numero internacional sin "+", ej. 5076...
 
-        if msg.get("type") != "text":
-            send_whatsapp(phone, "Por ahora solo puedo leer mensajes de texto.")
-            return make_response("ok", 200)
+            if msg.get("type") != "text":
+                send_whatsapp(phone, "Por ahora solo puedo leer mensajes de texto.")
+                continue
 
-        text = msg["text"]["body"].strip()
-        print(f"[USUARIO] {phone}: {text}")
+            text = msg["text"]["body"].strip()
+            print(f"[USUARIO] {phone}: {text}")
 
-        # Si un humano tomó el control, el bot calla.
-        if phone in ai.HUMAN_MODE:
-            print(f"[HITL] {phone} en modo humano — el bot calla")
-            return make_response("ok", 200)
+            # Si un humano tomó el control, el bot calla.
+            if phone in ai.HUMAN_MODE:
+                print(f"[HITL] {phone} en modo humano — el bot calla")
+                continue
 
-        # Mostramos "escribiendo..." de inmediato, pero el procesamiento real se
-        # agrupa con cualquier mensaje en cadena que llegue en los próximos
-        # DEBOUNCE_SECONDS (ver _queue_whatsapp) para responder una sola vez.
-        send_typing(msg.get("id", ""))
-        _queue_whatsapp(phone, text, msg.get("id", ""))
+            # Mostramos "escribiendo..." de inmediato, pero el procesamiento real se
+            # agrupa con cualquier mensaje en cadena que llegue en los próximos
+            # DEBOUNCE_SECONDS (ver _queue_whatsapp) para responder una sola vez.
+            send_typing(msg.get("id", ""))
+            _queue_whatsapp(phone, text, msg.get("id", ""))
 
     except Exception as e:
         print(f"[WEBHOOK] ERROR: {e}")
