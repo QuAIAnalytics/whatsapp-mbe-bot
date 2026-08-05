@@ -387,6 +387,12 @@ if CHATWOOT_ENABLED:
     def _cw_conversation_messages(conversation_id: int) -> list:
         """Descarga y ordena cronológicamente los mensajes de la conversación.
 
+        Usa el endpoint "show" de la conversación (`GET .../conversations/{id}`)
+        en vez del endpoint dedicado de mensajes (`GET .../messages`): un
+        token de Agent Bot puede usar "show" pero tiene prohibido el "index"
+        de mensajes (ver TODO.md) — "show" ya trae los mensajes recientes
+        adentro, así que nos sirve igual sin pedir un permiso que no da.
+
         Un solo GET, que se reutiliza tanto para armar el historial que ve la
         IA como para detectar si un humano ya tomó el control (ver
         `_cw_human_took_over`) — así ninguna de las dos cosas cuesta un
@@ -394,19 +400,24 @@ if CHATWOOT_ENABLED:
         """
         try:
             r = requests.get(
-                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/messages",
+                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}",
                 headers=_cw_headers(), timeout=10,
             )
             r.raise_for_status()
-            payload = r.json().get("payload", [])
+            messages = r.json().get("messages", [])
         except Exception as e:
             print(f"[CHATWOOT] history ERROR: {e}")
             return []
 
+        # No hay límite documentado para este array en la API de Chatwoot;
+        # este log deja ver cuántos llegan de verdad para verificarlo en la
+        # práctica (ver conversación sobre esto en el repo).
+        print(f"[CHATWOOT] conv {conversation_id}: {len(messages)} mensajes en 'show'")
+
         # La API de Chatwoot no garantiza orden ascendente (normalmente devuelve
         # los mensajes más recientes primero, pensado para paginar hacia atrás).
         # Ordenamos explícitamente por fecha para no armar el historial al revés.
-        return sorted(payload, key=lambda m: m.get("created_at") or 0)
+        return sorted(messages, key=lambda m: m.get("created_at") or 0)
 
     def cw_fetch_history(messages: list, exclude_ids=None, limit: int = 15) -> list:
         """Arma el historial para el cerebro a partir de los mensajes ya
