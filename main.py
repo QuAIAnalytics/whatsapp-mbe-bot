@@ -326,9 +326,9 @@ if CHATWOOT_ENABLED:
             print(f"[CHATWOOT] send ERROR: {e}")
 
     def cw_handoff(conversation_id: int) -> None:
-        """Pasa la conversación a un humano: la cambia a 'abierta' en la bandeja
-        y le pone la etiqueta 'agente' (reemplazando 'bot' si la tenía), para
-        que quede sincronizada con la automatización de Chatwoot."""
+        """Pasa la conversación a un humano: la cambia a 'abierta' en la
+        bandeja (la etiqueta 'agente' la pone _cw_go_silent, que siempre se
+        llama junto con esta función en los handoffs que decidimos nosotros)."""
         try:
             requests.post(
                 f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/toggle_status",
@@ -337,7 +337,6 @@ if CHATWOOT_ENABLED:
             print(f"[CHATWOOT] handoff conv {conversation_id} -> humano")
         except Exception as e:
             print(f"[CHATWOOT] handoff ERROR: {e}")
-        _cw_mark_agente(conversation_id)
 
     def _cw_conversation_labels(conversation_id: int) -> list:
         """Trae las etiquetas actuales de la conversación (vacío si falla)."""
@@ -520,13 +519,17 @@ if CHATWOOT_ENABLED:
     _pending_cw_timers: dict[int, threading.Timer] = {}
 
     def _cw_go_silent(conversation_id: int) -> None:
-        """Marca la conversación como 'en modo humano' y cancela cualquier
-        mensaje en cadena que estuviera esperando el debounce, para que el
-        bot no conteste después de que ya se pasó (o alguien más ya tomó) el
-        control. Se llama tanto cuando el handoff lo decidimos nosotros
-        (palabra clave, bucle, cotización completa) como cuando un agente
-        humano contesta manualmente desde Chatwoot (ver chatwoot_webhook)."""
+        """Marca la conversación como 'en modo humano', pone la etiqueta
+        'agente' (quita 'bot'), y cancela cualquier mensaje en cadena que
+        estuviera esperando el debounce, para que el bot no conteste después
+        de que ya se pasó (o alguien más ya tomó) el control. Se llama tanto
+        cuando el handoff lo decidimos nosotros (palabra clave, bucle,
+        cotización completa) como cuando un agente humano contesta
+        manualmente desde Chatwoot o se detecta vía historial — un solo
+        lugar para que la etiqueta siempre quede sincronizada, sin que haya
+        que cambiarla a mano."""
         _CW_HANDOFF[conversation_id] = time.time()
+        _cw_mark_agente(conversation_id)
         with _pending_cw_lock:
             _pending_cw_texts.pop(conversation_id, None)
             _pending_cw_ids.pop(conversation_id, None)
