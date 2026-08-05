@@ -319,13 +319,14 @@ if CHATWOOT_ENABLED:
         except Exception as e:
             print(f"[CHATWOOT] handoff ERROR: {e}")
 
-    def cw_fetch_history(conversation_id: int, exclude_ids=None, limit: int = 15) -> list:
-        """Trae los últimos mensajes de la conversación (ya persistidos en Chatwoot)
-        y los arma como historial para el cerebro, excluyendo los mensajes que
-        disparon este turno (pueden ser varios si el cliente mandó mensajes en
-        cadena y se agruparon, ver _queue_chatwoot).
+    def _cw_conversation_messages(conversation_id: int) -> list:
+        """Descarga y ordena cronológicamente los mensajes de la conversación.
+
+        Un solo GET, que se reutiliza tanto para armar el historial que ve la
+        IA como para detectar si un humano ya tomó el control (ver
+        `_cw_human_took_over`) — así ninguna de las dos cosas cuesta un
+        llamado extra a Chatwoot.
         """
-        exclude_ids = set(exclude_ids or ())
         try:
             r = requests.get(
                 f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/messages",
@@ -339,12 +340,18 @@ if CHATWOOT_ENABLED:
 
         # La API de Chatwoot no garantiza orden ascendente (normalmente devuelve
         # los mensajes más recientes primero, pensado para paginar hacia atrás).
-        # Ordenamos explícitamente por fecha para no armar el historial al revés
-        # o cortarlo del lado equivocado con `history[-limit:]`.
-        payload = sorted(payload, key=lambda m: m.get("created_at") or 0)
+        # Ordenamos explícitamente por fecha para no armar el historial al revés.
+        return sorted(payload, key=lambda m: m.get("created_at") or 0)
 
+    def cw_fetch_history(messages: list, exclude_ids=None, limit: int = 15) -> list:
+        """Arma el historial para el cerebro a partir de los mensajes ya
+        descargados, excluyendo los que disparon este turno (pueden ser
+        varios si el cliente mandó mensajes en cadena y se agruparon, ver
+        _queue_chatwoot).
+        """
+        exclude_ids = set(exclude_ids or ())
         history = []
-        for m in payload:
+        for m in messages:
             if m.get("id") in exclude_ids:
                 continue
             content = (m.get("content") or "").strip()
@@ -355,12 +362,49 @@ if CHATWOOT_ENABLED:
             history.append({"role": role, "text": content})
         return history[-limit:]
 
+    def _cw_human_took_over(conversation_id: int, messages: list, exclude_ids=None) -> bool:
+        """True si el último mensaje saliente de la conversación (sin contar
+        los del turno actual) lo mandó un agente humano y no pasó
+        CW_RESUME_H desde entonces.
+
+        No depende de RAM: se deriva del historial real de Chatwoot (mismos
+        datos que ya trajo `_cw_conversation_messages`), así que sigue
+        funcionando aunque `_CW_HANDOFF` se haya perdido por un reinicio en
+        frío de la instancia (ver hallazgo del log del 2026-08-04).
+        """
+        exclude_ids = set(exclude_ids or ())
+        for m in reversed(messages):
+            if m.get("id") in exclude_ids or m.get("message_type") != 1:
+                continue
+            sender_type = _cw_sender_type(m)
+            if sender_type.lower() != "user":
+                return False   # el último saliente fue nuestro bot: sigue libre
+            created_at = m.get("created_at")
+            if created_at and (time.time() - float(created_at)) >= CW_RESUME_H * 3600:
+                return False   # pasó el tiempo de "retomar"
+            print(f"[CHATWOOT] conv {conversation_id}: ultimo saliente sender_type={sender_type} "
+                  f"(detectado via historial, no via RAM)")
+            return True
+        return False
+
     def cw_process(conversation_id: int, phone: str, text: str, message_id: str = "", exclude_ids=None) -> None:
         """Corre el cerebro y responde por Chatwoot, en segundo plano (igual que WhatsApp)."""
         start = time.time()
         # Muestra "escribiendo..." en WhatsApp usando el id (wamid) del mensaje entrante.
         send_typing(message_id)
-        history = cw_fetch_history(conversation_id, exclude_ids)
+        messages = _cw_conversation_messages(conversation_id)
+
+        if _cw_human_took_over(conversation_id, messages, exclude_ids):
+            # La memoria en RAM no tenía este handoff (probable reinicio en
+            # frío de la instancia), pero el historial real de Chatwoot
+            # muestra que un humano ya contestó: nos callamos y de paso nos
+            # "autorreparamos" en RAM para que los próximos mensajes de esta
+            # conversación se resuelvan directo, sin este chequeo extra.
+            _cw_go_silent(conversation_id)
+            print(f"[CHATWOOT] conv {conversation_id}: handoff detectado via historial, bot en silencio")
+            return
+
+        history = cw_fetch_history(messages, exclude_ids)
         reply = handle_message(phone, text, history=history)
         # Si el cerebro pidió pasar con una persona, lo recogemos para el handoff en Chatwoot.
         handoff = phone in ai.HANDOFF_REQUESTS
@@ -410,16 +454,22 @@ if CHATWOOT_ENABLED:
         if timer:
             timer.cancel()
 
+    def _cw_sender_type(data: dict) -> str:
+        """Extrae quién mandó un mensaje/evento de Chatwoot ("user" = agente
+        humano, "agent_bot" = nuestro bot, "contact" = el cliente, etc.).
+        Se expone en los logs como campo visual para poder seguir el flujo
+        de la demo en Cloud Logging sin adivinar."""
+        sender_type = data.get("sender_type") or ""
+        if not sender_type:
+            sender_type = (data.get("sender") or {}).get("type") or ""
+        return sender_type or "desconocido"
+
     def _cw_sent_by_human_agent(data: dict) -> bool:
         """True si un mensaje saliente lo mandó un agente humano real desde
         Chatwoot, no nuestro Agent Bot (asume que CHATWOOT_API_TOKEN es un
         token de Agent Bot dedicado, no la cuenta personal de un agente —
         si no, Chatwoot no puede distinguir uno de otro)."""
-        sender_type = (data.get("sender_type") or "").lower()
-        if sender_type:
-            return sender_type == "user"
-        nested = ((data.get("sender") or {}).get("type") or "").lower()
-        return nested == "user"
+        return _cw_sender_type(data).lower() == "user"
 
     def _flush_chatwoot(conversation_id: int, phone: str, message_id: str) -> None:
         """Se dispara cuando pasan DEBOUNCE_SECONDS sin mensajes nuevos en esta
@@ -465,9 +515,14 @@ if CHATWOOT_ENABLED:
         # Agent Bot): tratamos eso como handoff inmediato, sin esperar a que
         # nosotros mismos lo disparemos por algún otro camino.
         if event == "message_created" and data.get("message_type") == "outgoing":
+            sender_type = _cw_sender_type(data)
             if conversation_id and _cw_sent_by_human_agent(data):
                 _cw_go_silent(conversation_id)
-                print(f"[CHATWOOT] conv {conversation_id}: agente humano contestó, bot en silencio")
+                print(f"[CHATWOOT] conv {conversation_id}: mensaje saliente sender_type={sender_type} "
+                      f"-> agente humano, bot en silencio")
+            else:
+                print(f"[CHATWOOT] conv {conversation_id}: mensaje saliente sender_type={sender_type} "
+                      f"(no dispara handoff)")
             return make_response("ok", 200)
 
         # Solo nos interesan mensajes nuevos ENTRANTES (del cliente), no los salientes/bot.
@@ -514,7 +569,8 @@ if CHATWOOT_ENABLED:
         # source_id = id del mensaje original de WhatsApp (wamid); lo usamos para el typing.
         message_id = data.get("source_id") or ""
         cw_message_id = data.get("id")
-        print(f"[CHATWOOT] conv {conversation_id} ({phone}) wamid={message_id or '∅'}: {text}")
+        print(f"[CHATWOOT] conv {conversation_id} ({phone}) sender_type={_cw_sender_type(data)} "
+              f"wamid={message_id or '∅'}: {text}")
         # Mostramos "escribiendo..." de inmediato, pero el procesamiento real se
         # agrupa con cualquier mensaje en cadena que llegue en los próximos
         # DEBOUNCE_SECONDS (ver _queue_chatwoot) para responder una sola vez.
