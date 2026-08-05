@@ -23,17 +23,19 @@ conversaciones (`show`, `toggle_status`, `toggle_typing_status`,
 conversación (**solo `create`**, NO `index`/listar), asignaciones (`create`),
 y etiquetas (`index`, `create`).
 
-Por eso `_cw_conversation_messages` (`main.py`) lee el historial vía
+**Probado y descartado (2026-08-05):** intentamos leer el historial vía
 `GET /conversations/{id}` (acción "show", sí permitida para bots) en vez de
-`GET /conversations/{id}/messages` (acción "index", bloqueada para bots) —
-"show" ya trae los mensajes recientes adentro. Pendiente de verificar en la
-práctica (con el log que deja `_cw_conversation_messages`) si ese array trae
-suficiente historial para conversaciones largas, o si hace falta otra
-estrategia (Chatwoot no documenta un límite fijo para ese array).
+`GET /conversations/{id}/messages` (acción "index", bloqueada para bots),
+esperando que "show" trajera los mensajes recientes adentro. En la práctica
+**solo trae 1 mensaje** (no documentado en la API, comprobado en logs
+reales: `"conv X: 1 mensajes en 'show'"`) — insuficiente para la memoria de
+la conversación, causó que el bot se volviera a presentar a mitad de una
+cotización. Se revirtió a `GET /conversations/{id}/messages`.
 
-Si en algún momento `CHATWOOT_API_TOKEN` vuelve a ser el de un agente humano
-dedicado (no un Agent Bot real), `_cw_is_other_human` ya contempla ese caso
-comparando el `sender.id` contra el ID propio (vía `GET /api/v1/profile`) —
-pero ese endpoint de perfil probablemente tampoco está permitido para un
-Agent Bot real, así que con un Agent Bot esa parte del código simplemente no
-se ejecuta (el chequeo de `sender_type` ya filtra antes de llegar ahí).
+**Conclusión:** con las acciones que Chatwoot permite hoy a un Agent Bot, no
+hay forma de leer suficiente historial. Mientras sigamos necesitando
+memoria de conversación completa, `CHATWOOT_API_TOKEN` tiene que ser el
+token de un agente humano dedicado (no un Agent Bot real) — es la única
+combinación que funciona con lo que expone la API. `_cw_is_other_human` ya
+contempla ese caso comparando el `sender.id` contra el ID propio (vía
+`GET /api/v1/profile`) para no autosilenciarse.

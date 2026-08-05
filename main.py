@@ -387,11 +387,13 @@ if CHATWOOT_ENABLED:
     def _cw_conversation_messages(conversation_id: int) -> list:
         """Descarga y ordena cronológicamente los mensajes de la conversación.
 
-        Usa el endpoint "show" de la conversación (`GET .../conversations/{id}`)
-        en vez del endpoint dedicado de mensajes (`GET .../messages`): un
-        token de Agent Bot puede usar "show" pero tiene prohibido el "index"
-        de mensajes (ver TODO.md) — "show" ya trae los mensajes recientes
-        adentro, así que nos sirve igual sin pedir un permiso que no da.
+        Probamos usar el endpoint "show" de la conversación (accesible para
+        Agent Bots) para no depender del endpoint de mensajes ("index",
+        bloqueado para bots) — pero en la práctica "show" solo trae 1
+        mensaje (no documentado, comprobado en logs reales el 2026-08-05),
+        insuficiente para la memoria de la conversación. Volvemos al
+        endpoint de mensajes de siempre; solo funciona con un token de
+        agente normal, no con un Agent Bot real (ver TODO.md).
 
         Un solo GET, que se reutiliza tanto para armar el historial que ve la
         IA como para detectar si un humano ya tomó el control (ver
@@ -400,19 +402,14 @@ if CHATWOOT_ENABLED:
         """
         try:
             r = requests.get(
-                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}",
+                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/messages",
                 headers=_cw_headers(), timeout=10,
             )
             r.raise_for_status()
-            messages = r.json().get("messages", [])
+            messages = r.json().get("payload", [])
         except Exception as e:
             print(f"[CHATWOOT] history ERROR: {e}")
             return []
-
-        # No hay límite documentado para este array en la API de Chatwoot;
-        # este log deja ver cuántos llegan de verdad para verificarlo en la
-        # práctica (ver conversación sobre esto en el repo).
-        print(f"[CHATWOOT] conv {conversation_id}: {len(messages)} mensajes en 'show'")
 
         # La API de Chatwoot no garantiza orden ascendente (normalmente devuelve
         # los mensajes más recientes primero, pensado para paginar hacia atrás).
