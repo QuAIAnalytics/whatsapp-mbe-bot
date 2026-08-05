@@ -430,6 +430,7 @@ def handle(phone: str, text: str, history: list | None = None) -> str | None:
     # saludo natural. Si el primer mensaje ya trae una intención real (ej.
     # "quiero cotizar un envío"), se atiende directo, sin descartarlo.
     if first_time and intent == "GREETING":
+        print(f"[MBE] saludo -> {phone}: {WELCOME[:80]}")
         return WELCOME
 
     reply = ai.chat_reply(f"mbe:{phone}", GENERAL_PROMPT, text, history=history)
