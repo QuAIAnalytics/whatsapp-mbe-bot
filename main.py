@@ -363,7 +363,9 @@ if CHATWOOT_ENABLED:
         Si no tiene esa etiqueta (ej. tiene 'bot', o ninguna todavía por una
         automatización lenta), respondemos normal: es más seguro fallar
         hacia "sí responder" que quedarse mudo por un error de lectura."""
-        return "agente" in [l.lower() for l in _cw_conversation_labels(conversation_id)]
+        labels = _cw_conversation_labels(conversation_id)
+        print(f"[CHATWOOT] conv {conversation_id}: etiquetas actuales = {labels or '(ninguna)'}")
+        return "agente" in [l.lower() for l in labels]
 
     def _cw_conversation_messages(conversation_id: int) -> list:
         """Descarga y ordena cronológicamente los mensajes de la conversación.
