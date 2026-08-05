@@ -15,6 +15,8 @@ Variables de entorno (.env):
     CHATWOOT                   true|false (default false) — deja en false
 """
 
+import hashlib
+import hmac
 import os
 import random
 import threading
@@ -277,6 +279,21 @@ if CHATWOOT_ENABLED:
     CW_INBOX     = os.environ.get("CHATWOOT_INBOX_ID", "")
     CW_TOKEN     = os.environ.get("CHATWOOT_API_TOKEN", "")
     CW_RESUME_H  = float(os.environ.get("CHATWOOT_HANDOFF_RESUME_HOURS", "12"))
+    # Secret del Agent Bot (distinto del access token): sirve para verificar
+    # que los webhooks que llegan a /chatwoot realmente los mandó Chatwoot
+    # (viene firmado con HMAC-SHA256 en el header X-Chatwoot-Signature). Si
+    # no se configura, no se puede verificar y se deja pasar todo (igual que
+    # antes de este cambio) — mejor eso que romper el bot por no tenerlo.
+    CW_WEBHOOK_SECRET = os.environ.get("CHATWOOT_WEBHOOK_SECRET", "")
+
+    def _cw_verify_signature(raw_body: bytes, signature_header: str) -> bool:
+        if not CW_WEBHOOK_SECRET:
+            return True
+        if not signature_header or not signature_header.startswith("sha256="):
+            return False
+        expected = hmac.new(CW_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+        provided = signature_header.split("=", 1)[1]
+        return hmac.compare_digest(expected, provided)
 
     # Frases (normalizadas) con las que el cliente pide hablar con una persona.
     HANDOFF_KEYWORDS = (
@@ -557,6 +574,10 @@ if CHATWOOT_ENABLED:
     @app.route("/chatwoot", methods=["POST"])
     def chatwoot_webhook():
         """Recibe los eventos del Agent Bot de Chatwoot."""
+        if not _cw_verify_signature(request.get_data(), request.headers.get("X-Chatwoot-Signature", "")):
+            print("[CHATWOOT] firma invalida (X-Chatwoot-Signature no coincide) — request rechazado")
+            return make_response("forbidden", 403)
+
         data = request.get_json(silent=True) or {}
         event = data.get("event")
 
