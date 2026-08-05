@@ -309,7 +309,9 @@ if CHATWOOT_ENABLED:
             print(f"[CHATWOOT] send ERROR: {e}")
 
     def cw_handoff(conversation_id: int) -> None:
-        """Pasa la conversación a un humano: la cambia a 'abierta' en la bandeja."""
+        """Pasa la conversación a un humano: la cambia a 'abierta' en la bandeja
+        y le pone la etiqueta 'agente' (reemplazando 'bot' si la tenía), para
+        que quede sincronizada con la automatización de Chatwoot."""
         try:
             requests.post(
                 f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/toggle_status",
@@ -318,6 +320,50 @@ if CHATWOOT_ENABLED:
             print(f"[CHATWOOT] handoff conv {conversation_id} -> humano")
         except Exception as e:
             print(f"[CHATWOOT] handoff ERROR: {e}")
+        _cw_mark_agente(conversation_id)
+
+    def _cw_conversation_labels(conversation_id: int) -> list:
+        """Trae las etiquetas actuales de la conversación (vacío si falla)."""
+        try:
+            r = requests.get(
+                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/labels",
+                headers=_cw_headers(), timeout=10,
+            )
+            r.raise_for_status()
+            return r.json().get("payload", [])
+        except Exception as e:
+            print(f"[CHATWOOT] labels GET ERROR: {e}")
+            return []
+
+    def _cw_set_labels(conversation_id: int, labels: list) -> None:
+        """Reemplaza las etiquetas de la conversación (la API de Chatwoot
+        sobrescribe la lista completa, no la agrega — por eso siempre
+        mandamos el set completo, no solo la etiqueta nueva)."""
+        try:
+            requests.post(
+                f"{CW_BASE}/api/v1/accounts/{CW_ACCOUNT}/conversations/{conversation_id}/labels",
+                json={"labels": labels}, headers=_cw_headers(), timeout=10,
+            )
+            print(f"[CHATWOOT] conv {conversation_id}: etiquetas -> {labels}")
+        except Exception as e:
+            print(f"[CHATWOOT] labels POST ERROR: {e}")
+
+    def _cw_mark_agente(conversation_id: int) -> None:
+        """Cambia la etiqueta de la conversación a 'agente' (quita 'bot' si
+        estaba), para que el chequeo de silencio (ver _cw_should_stay_silent)
+        y la automatización de Chatwoot lean la misma señal."""
+        labels = set(_cw_conversation_labels(conversation_id))
+        labels.discard("bot")
+        labels.add("agente")
+        _cw_set_labels(conversation_id, sorted(labels))
+
+    def _cw_labeled_agente(conversation_id: int) -> bool:
+        """True si la conversación tiene la etiqueta 'agente' puesta (manual
+        o por automatización de Chatwoot) — no respondemos en ese caso.
+        Si no tiene esa etiqueta (ej. tiene 'bot', o ninguna todavía por una
+        automatización lenta), respondemos normal: es más seguro fallar
+        hacia "sí responder" que quedarse mudo por un error de lectura."""
+        return "agente" in [l.lower() for l in _cw_conversation_labels(conversation_id)]
 
     def _cw_conversation_messages(conversation_id: int) -> list:
         """Descarga y ordena cronológicamente los mensajes de la conversación.
@@ -394,6 +440,13 @@ if CHATWOOT_ENABLED:
         send_typing(message_id)
         messages = _cw_conversation_messages(conversation_id)
 
+        if _cw_labeled_agente(conversation_id):
+            # Señal explícita (manual o por automatización de Chatwoot): esta
+            # conversación está marcada para que la atienda una persona.
+            _cw_go_silent(conversation_id)
+            print(f"[CHATWOOT] conv {conversation_id}: etiqueta 'agente' activa, bot en silencio")
+            return
+
         if _cw_human_took_over(conversation_id, messages, exclude_ids):
             # La memoria en RAM no tenía este handoff (probable reinicio en
             # frío de la instancia), pero el historial real de Chatwoot
@@ -459,10 +512,14 @@ if CHATWOOT_ENABLED:
         humano, "agent_bot" = nuestro bot, "contact" = el cliente, etc.).
         Se expone en los logs como campo visual para poder seguir el flujo
         de la demo en Cloud Logging sin adivinar."""
-        sender_type = data.get("sender_type") or ""
-        if not sender_type:
-            sender_type = (data.get("sender") or {}).get("type") or ""
-        return sender_type or "desconocido"
+        sender_type = data.get("sender_type") or (data.get("sender") or {}).get("type") or ""
+        if sender_type:
+            return sender_type
+        # El payload de Chatwoot no siempre trae sender_type en mensajes
+        # entrantes, pero un entrante siempre es del cliente por definición.
+        if data.get("message_type") in ("incoming", 0):
+            return "contact"
+        return "desconocido"
 
     def _cw_sent_by_human_agent(data: dict) -> bool:
         """True si un mensaje saliente lo mandó un agente humano real desde
