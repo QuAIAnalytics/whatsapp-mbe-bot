@@ -441,13 +441,13 @@ if CHATWOOT_ENABLED:
         for m in reversed(messages):
             if m.get("id") in exclude_ids or m.get("message_type") != 1:
                 continue
-            sender_type = _cw_sender_type(m)
-            if sender_type.lower() != "user":
-                return False   # el último saliente fue nuestro bot: sigue libre
+            if not _cw_is_other_human(m):
+                return False   # el último saliente fuimos nosotros: sigue libre
             created_at = m.get("created_at")
             if created_at and (time.time() - float(created_at)) >= CW_RESUME_H * 3600:
                 return False   # pasó el tiempo de "retomar"
-            print(f"[CHATWOOT] conv {conversation_id}: ultimo saliente sender_type={sender_type} "
+            sender_id = (m.get("sender") or {}).get("id")
+            print(f"[CHATWOOT] conv {conversation_id}: ultimo saliente de otro agente (id={sender_id}) "
                   f"(detectado via historial, no via RAM)")
             return True
         return False
@@ -540,12 +540,42 @@ if CHATWOOT_ENABLED:
             return "contact"
         return "desconocido"
 
-    def _cw_sent_by_human_agent(data: dict) -> bool:
-        """True si un mensaje saliente lo mandó un agente humano real desde
-        Chatwoot, no nuestro Agent Bot (asume que CHATWOOT_API_TOKEN es un
-        token de Agent Bot dedicado, no la cuenta personal de un agente —
-        si no, Chatwoot no puede distinguir uno de otro)."""
-        return _cw_sender_type(data).lower() == "user"
+    _cw_self_agent_id_cache = [None]  # lista para poder mutar desde la closure
+
+    def _cw_own_agent_id():
+        """ID del agente de Chatwoot detrás de nuestro CHATWOOT_API_TOKEN
+        (usamos un token de agente dedicado normal, no un Agent Bot — un
+        Agent Bot no puede leer el historial de mensajes, ver TODO.md).
+
+        Se consulta una sola vez por instancia (GET /api/v1/profile) y se
+        cachea en memoria: como el token es de un agente normal, Chatwoot
+        marca TODOS los mensajes salientes con sender_type='user', tanto los
+        nuestros como los de cualquier otro agente humano — hay que comparar
+        el id para saber cuál es cuál.
+        """
+        if _cw_self_agent_id_cache[0] is not None:
+            return _cw_self_agent_id_cache[0]
+        try:
+            r = requests.get(f"{CW_BASE}/api/v1/profile", headers=_cw_headers(), timeout=10)
+            r.raise_for_status()
+            agent_id = r.json().get("id")
+            _cw_self_agent_id_cache[0] = agent_id
+            print(f"[CHATWOOT] identidad propia detectada: agent id={agent_id}")
+            return agent_id
+        except Exception as e:
+            print(f"[CHATWOOT] profile ERROR: {e}")
+            return None
+
+    def _cw_is_other_human(data: dict) -> bool:
+        """True si el remitente de este mensaje/evento es un agente humano
+        DISTINTO de la cuenta que usa nuestro token (no nosotros mismos)."""
+        if _cw_sender_type(data).lower() != "user":
+            return False
+        own_id = _cw_own_agent_id()
+        if own_id is None:
+            return True   # no pudimos confirmar quiénes somos: más seguro asumir que es otro humano
+        sender_id = (data.get("sender") or {}).get("id")
+        return sender_id != own_id
 
     def _flush_chatwoot(conversation_id: int, phone: str, message_id: str) -> None:
         """Se dispara cuando pasan DEBOUNCE_SECONDS sin mensajes nuevos en esta
@@ -591,17 +621,17 @@ if CHATWOOT_ENABLED:
                 _CW_HANDOFF.pop(conversation_id, None)
             return make_response("ok", 200)
 
-        # Un agente humano contestó manualmente desde Chatwoot (no nuestro
-        # Agent Bot): tratamos eso como handoff inmediato, sin esperar a que
-        # nosotros mismos lo disparemos por algún otro camino.
+        # Un agente humano contestó manualmente desde Chatwoot (no nosotros):
+        # tratamos eso como handoff inmediato, sin esperar a que nosotros
+        # mismos lo disparemos por algún otro camino.
         if event == "message_created" and data.get("message_type") == "outgoing":
-            sender_type = _cw_sender_type(data)
-            if conversation_id and _cw_sent_by_human_agent(data):
+            sender_id = (data.get("sender") or {}).get("id")
+            if conversation_id and _cw_is_other_human(data):
                 _cw_go_silent(conversation_id)
-                print(f"[CHATWOOT] conv {conversation_id}: mensaje saliente sender_type={sender_type} "
-                      f"-> agente humano, bot en silencio")
+                print(f"[CHATWOOT] conv {conversation_id}: mensaje saliente de otro agente (id={sender_id}) "
+                      f"-> bot en silencio")
             else:
-                print(f"[CHATWOOT] conv {conversation_id}: mensaje saliente sender_type={sender_type} "
+                print(f"[CHATWOOT] conv {conversation_id}: mensaje saliente propio (id={sender_id}) "
                       f"(no dispara handoff)")
             return make_response("ok", 200)
 
